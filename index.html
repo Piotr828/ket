@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <title>Bloch Sphere Visualizer</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #0f0f14;
+            font-family: sans-serif;
+            user-select: none;
+        }
+        #info-panel {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: #f1f1f1;
+            font-size: 18px;
+            line-height: 1.5;
+            pointer-events: none;
+            z-index: 10;
+        }
+        #sub-info {
+            color: #888888;
+        }
+        .ket-label {
+            position: absolute;
+            color: white;
+            font-family: monospace;
+            font-size: 20px;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+            white-space: nowrap;
+            z-index: 5;
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+
+    <div id="info-panel">
+        <div>Gate Mode: X, Y, Z, H, S, T, M | Shift: Inverse | R: Reset</div>
+        <div id="sub-info">LPM: Obrót kamery | PPM: Obrót wektora</div>
+    </div>
+
+    <div id="labels-container"></div>
+
+    <script>
+        //  Klasa pomocnicza dla liczb zespolonych 
+        class Complex {
+            constructor(re, im = 0) {
+                this.re = re;
+                this.im = im;
+            }
+            add(c) { return new Complex(this.re + c.re, this.im + c.im); }
+            mul(c) { return new Complex(this.re * c.re - this.im * c.im, this.re * c.im + this.im * c.re); }
+            divReal(n) { return new Complex(this.re / n, this.im / n); }
+            abs() { return Math.hypot(this.re, this.im); }
+            norm() { return this.re * this.re + this.im * this.im; }
+            arg() { return Math.atan2(this.im, this.re); }
+            static exp(c) {
+                const r = Math.exp(c.re);
+                return new Complex(r * Math.cos(c.im), r * Math.sin(c.im));
+            }
+        }
+        const I = new Complex(0, 1);
+
+        //  Inicjalizacja sceny Three.js 
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0f0f14);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.enablePan = false;
+        controls.minDistance = 2;
+        controls.maxDistance = 10;
+        
+        // Startowa pozycja kamery
+        camera.position.set(2.8, 2.0, 3.2); 
+        controls.update();
+
+        // Zablokowanie domyślnego menu po kliknięciu PPM
+        window.addEventListener('contextmenu', e => e.preventDefault());
+
+        //  Geometria Sfery Blocha 
+        const sphereGeo = new THREE.SphereGeometry(1, 40, 40);
+        const sphereMat = new THREE.MeshBasicMaterial({
+            color: 0xc8c8ff,
+            wireframe: true,
+            transparent: true,
+            opacity: 0.12
+        });
+        const sphere = new THREE.Mesh(sphereGeo, sphereMat);
+        scene.add(sphere);
+
+        // Osie (X: Zielona, Y: Różowa, Z: Żółta)
+        function createAxis(start, end, colorHex) {
+            const points = [start, end];
+            const geo = new THREE.BufferGeometry().setFromPoints(points);
+            const mat = new THREE.LineBasicMaterial({ color: colorHex, transparent: true, opacity: 0.25 });
+            return new THREE.Line(geo, mat);
+        }
+        scene.add(createAxis(new THREE.Vector3(-1.2, 0, 0), new THREE.Vector3(1.2, 0, 0), 0x00ff00));
+        scene.add(createAxis(new THREE.Vector3(0, -1.2, 0), new THREE.Vector3(0, 1.2, 0), 0xff64b4));
+        scene.add(createAxis(new THREE.Vector3(0, 0, -1.2), new THREE.Vector3(0, 0, 1.2), 0xffff00));
+
+        //  Zaznaczenie aktywnej osi bramki 
+        const activeAxisGroup = new THREE.Group();
+        scene.add(activeAxisGroup);
+
+        // Linia osi (wzdłuż Z, aby ładnie działało obracanie całą grupą za pomocą normalnej okręgu)
+        const axisLineGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, -1.5), new THREE.Vector3(0, 0, 1.5)]);
+        const axisLineMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0 });
+        const axisLine = new THREE.Line(axisLineGeo, axisLineMat);
+        activeAxisGroup.add(axisLine);
+
+        // Okrąg obrotu (geometria Ring domyślnie leży na XY, jej normalna to Z)
+        const axisCircleGeo = new THREE.RingGeometry(0.99, 1.01, 64);
+        const axisCircleMat = new THREE.MeshBasicMaterial({ color: 0x0096ff, side: THREE.DoubleSide, transparent: true, opacity: 0 });
+        const axisCircle = new THREE.Mesh(axisCircleGeo, axisCircleMat);
+        activeAxisGroup.add(axisCircle);
+
+        //  Wskaźnik stanu (Wektor wzdłuż +Y) 
+        const stateGroup = new THREE.Group();
+        scene.add(stateGroup);
+
+        // Cylinder z punktem obrotu w (0,0,0) skierowany w +Y (Ket |0>)
+        const pointerGeo = new THREE.CylinderGeometry(0.015, 0.015, 1, 8);
+        pointerGeo.translate(0, 0.5, 0); 
+        const pointerMat = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+        const pointerMesh = new THREE.Mesh(pointerGeo, pointerMat);
+        stateGroup.add(pointerMesh);
+
+        // Kula na końcu wskaźnika
+        const tipGeo = new THREE.SphereGeometry(0.04, 16, 16);
+        tipGeo.translate(0, 1, 0);
+        const tipMesh = new THREE.Mesh(tipGeo, pointerMat);
+        stateGroup.add(tipMesh);
+
+        //  Etykiety (Kety) 
+        const labelsData = [
+            { pos: new THREE.Vector3(0, 1.1, 0), text: "|0⟩" },
+            { pos: new THREE.Vector3(0, -1.1, 0), text: "|1⟩" },
+            { pos: new THREE.Vector3(1.1, 0, 0), text: "|+⟩" },
+            { pos: new THREE.Vector3(-1.1, 0, 0), text: "|-⟩" },
+            { pos: new THREE.Vector3(0, 0, 1.1), text: "|+i⟩" },
+            { pos: new THREE.Vector3(0, 0, -1.1), text: "|-i⟩" }
+        ];
+
+        const labelsContainer = document.getElementById('labels-container');
+        labelsData.forEach(data => {
+            const div = document.createElement('div');
+            div.className = 'ket-label';
+            div.innerText = data.text;
+            data.element = div;
+            labelsContainer.appendChild(div);
+        });
+
+        //  Logika Kwantowa i Stan 
+        let stateQuaternion = new THREE.Quaternion().identity();
+        let targetQuaternion = new THREE.Quaternion().identity();
+        let startQuaternion = new THREE.Quaternion().identity();
+
+        let animTimer = 0.0;
+        const animDuration = 0.25;
+
+        let target_c0 = new Complex(1, 0);
+        let target_c1 = new Complex(0, 0);
+        let startPhase = 0.0;
+        let targetPhase = 0.0;
+        let currentPhase = 0.0;
+
+        let axisTimer = 0.0;
+        let activeAxis = new THREE.Vector3();
+
+        function getGlobalPhase(c0, c1) {
+            if (c0.abs() > 1e-4) return c0.arg();
+            return c1.arg();
+        }
+
+        function lerpAngle(a, b, t) {
+            let d = b - a;
+            while (d > Math.PI) d -= 2 * Math.PI;
+            while (d < -Math.PI) d += 2 * Math.PI;
+            return a + d * t;
+        }
+
+        function applyMatrix(u00, u01, u10, u11) {
+            let n0 = u00.mul(target_c0).add(u01.mul(target_c1));
+            let n1 = u10.mul(target_c0).add(u11.mul(target_c1));
+            let norm = Math.sqrt(n0.norm() + n1.norm());
+            target_c0 = n0.divReal(norm);
+            target_c1 = n1.divReal(norm);
+        }
+
+        function applyGate(axis, angle, u00, u01, u10, u11) {
+            if (animTimer > 0.0) {
+                stateQuaternion.copy(targetQuaternion);
+                startPhase = targetPhase;
+            } else {
+                startPhase = getGlobalPhase(target_c0, target_c1);
+            }
+
+            startQuaternion.copy(stateQuaternion);
+            
+            const qGate = new THREE.Quaternion().setFromAxisAngle(axis, angle);
+            targetQuaternion.multiplyQuaternions(qGate, stateQuaternion);
+            
+            applyMatrix(u00, u01, u10, u11);
+            
+            let globalPhase = target_c0.arg();
+            let phaseFix = Complex.exp(I.mul(new Complex(-globalPhase)));
+            target_c0 = target_c0.mul(phaseFix);
+            target_c1 = target_c1.mul(phaseFix);
+            
+            targetPhase = getGlobalPhase(target_c0, target_c1);
+
+            activeAxis.copy(axis);
+            axisTimer = 2.5;
+            animTimer = animDuration;
+
+            // Ustawienie transformacji (kierujemy wektor lokalnej osi Z obiektu w stronę activeAxis)
+            axisLineMat.opacity = 0.47;
+            axisCircleMat.opacity = 0.47;
+            activeAxisGroup.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), activeAxis);
+        }
+
+        // Obsługa Klawiatury
+        window.addEventListener('keydown', (e) => {
+            const shift = e.shiftKey;
+            const dir = shift ? -1.0 : 1.0;
+            const key = e.key.toUpperCase();
+
+            if (key === 'X') {
+                applyGate(new THREE.Vector3(1, 0, 0), dir * Math.PI, new Complex(0), new Complex(1), new Complex(1), new Complex(0));
+            }
+            if (key === 'Z') {
+                applyGate(new THREE.Vector3(0, 1, 0), dir * Math.PI, new Complex(1), new Complex(0), new Complex(0), new Complex(-1));
+            }
+            if (key === 'Y') {
+                applyGate(new THREE.Vector3(0, 0, 1), dir * Math.PI, new Complex(0), I.mul(new Complex(-1)), I, new Complex(0));
+            }
+            if (key === 'H') {
+                let axis = new THREE.Vector3(1, 1, 0).normalize();
+                let invSqrt2 = new Complex(1 / Math.sqrt(2));
+                applyGate(axis, dir * Math.PI, invSqrt2, invSqrt2, invSqrt2, invSqrt2.mul(new Complex(-1)));
+            }
+            if (key === 'S') {
+                if (dir > 0) applyGate(new THREE.Vector3(0, 1, 0), Math.PI / 2, new Complex(1), new Complex(0), new Complex(0), I);
+                else applyGate(new THREE.Vector3(0, 1, 0), -Math.PI / 2, new Complex(1), new Complex(0), new Complex(0), I.mul(new Complex(-1)));
+            }
+            if (key === 'T') {
+                let angle = Math.PI / 4;
+                if (dir > 0) applyGate(new THREE.Vector3(0, 1, 0), angle, new Complex(1), new Complex(0), new Complex(0), Complex.exp(I.mul(new Complex(angle))));
+                else applyGate(new THREE.Vector3(0, 1, 0), -angle, new Complex(1), new Complex(0), new Complex(0), Complex.exp(I.mul(new Complex(-angle))));
+            }
+            if (key === 'R') { 
+                // Reset poprawnie celujący do |0> (Brak obrotu / Identity)
+                if (animTimer > 0.0) stateQuaternion.copy(targetQuaternion);
+                startQuaternion.copy(stateQuaternion);
+                
+                targetQuaternion.identity();
+                target_c0 = new Complex(1, 0);
+                target_c1 = new Complex(0, 0);
+                startPhase = targetPhase;
+                targetPhase = 0.0;
+                
+                axisTimer = 0.0;
+                animTimer = animDuration;
+            }
+            if (key === 'M') { 
+                // Kolaps / Pomiar
+                if (animTimer > 0.0) stateQuaternion.copy(targetQuaternion);
+                startQuaternion.copy(stateQuaternion);
+
+                let p0 = target_c0.norm();
+                let r = Math.random();
+
+                if (r <= p0) {
+                    // Kolaps do |0> (Identity / góra)
+                    targetQuaternion.identity();
+                    target_c0 = new Complex(1, 0);
+                    target_c1 = new Complex(0, 0);
+                } else {
+                    // Kolaps do |1> (Obrót PI o X / dół)
+                    targetQuaternion.setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI);
+                    target_c0 = new Complex(0, 0);
+                    target_c1 = new Complex(1, 0);
+                }
+                
+                startPhase = targetPhase;
+                targetPhase = 0.0;
+                axisTimer = 0.0;
+                animTimer = animDuration;
+            }
+        });
+
+        //  Obsługa PPM (Interaktywny obrót wektora stanu) 
+        let isRightMouseDown = false;
+        let prevMousePosition = { x: 0, y: 0 };
+
+        window.addEventListener('mousedown', (e) => {
+            if (e.button === 2 && animTimer <= 0.0) { 
+                isRightMouseDown = true;
+                prevMousePosition = { x: e.clientX, y: e.clientY };
+                controls.enabled = false; 
+            }
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (!isRightMouseDown || animTimer > 0.0) return;
+
+            let deltaX = e.clientX - prevMousePosition.x;
+            let deltaY = e.clientY - prevMousePosition.y;
+            prevMousePosition = { x: e.clientX, y: e.clientY };
+
+            // Odtworzenie zachowania względem kamery tak jak w C++
+            let camForward = new THREE.Vector3().subVectors(controls.target, camera.position).normalize();
+            let camRight = new THREE.Vector3().crossVectors(camForward, new THREE.Vector3(0, 1, 0)).normalize();
+            let camUp = new THREE.Vector3().crossVectors(camRight, camForward).normalize();
+
+            let qY = new THREE.Quaternion().setFromAxisAngle(camUp, -deltaX * 0.005);
+            let qX = new THREE.Quaternion().setFromAxisAngle(camRight, -deltaY * 0.005);
+            let rotMouse = new THREE.Quaternion().multiplyQuaternions(qX, qY);
+
+            // Mnożenie z lewej storny (premultiply) dokładnie odpowiada QuaternionMultiply(rotMouse, stateRotation)
+            stateQuaternion.premultiply(rotMouse).normalize();
+            targetQuaternion.copy(stateQuaternion);
+
+            let w = rotMouse.w, x = rotMouse.x, y = rotMouse.y, z = rotMouse.z;
+            let u00 = new Complex(w, -y);
+            let u01 = new Complex(-z, -x);
+            let u10 = new Complex(z, -x);
+            let u11 = new Complex(w, y);
+
+            applyMatrix(u00, u01, u10, u11);
+
+            targetPhase = getGlobalPhase(target_c0, target_c1);
+            startPhase = targetPhase;
+        });
+
+        window.addEventListener('mouseup', (e) => {
+            if (e.button === 2) {
+                isRightMouseDown = false;
+                controls.enabled = true;
+            }
+        });
+
+        //  Pętla Główna 
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const dt = clock.getDelta();
+
+            // Animacja zanikania osi obrotu
+            if (axisTimer > 0.0) {
+                axisTimer -= dt;
+                let alpha = 0.47 * (axisTimer / 2.5);
+                axisLineMat.opacity = Math.max(alpha, 0);
+                axisCircleMat.opacity = Math.max(alpha, 0);
+            } else {
+                axisLineMat.opacity = 0;
+                axisCircleMat.opacity = 0;
+            }
+
+            // Animacja połozenia (Slerp) i fazy
+            if (animTimer > 0.0) {
+                animTimer -= dt;
+                if (animTimer <= 0.0) {
+                    animTimer = 0.0;
+                    stateQuaternion.copy(targetQuaternion);
+                    currentPhase = targetPhase;
+                } else {
+                    let t = 1.0 - (animTimer / animDuration);
+                    let ease = t * t * (3.0 - 2.0 * t);
+                    stateQuaternion.copy(startQuaternion).slerp(targetQuaternion, ease);
+                    currentPhase = lerpAngle(startPhase, targetPhase, ease);
+                }
+            } else {
+                currentPhase = targetPhase;
+            }
+
+            // Aplikacja obliczonej rotacji do wektora stanu
+            stateGroup.quaternion.copy(stateQuaternion);
+
+            // Kolorowanie wskaźnika w zależności od Fazy (odpowiednik HSV)
+            let hue = ((currentPhase + Math.PI) / (2 * Math.PI)) % 1.0;
+            if (hue < 0) hue += 1.0;
+            let color = new THREE.Color().setHSL(hue, 1.0, 0.5);
+            pointerMat.color.copy(color);
+
+            controls.update();
+            renderer.render(scene, camera);
+
+            // Pozycjonowanie etykiet HTML (ketów)
+            const wp = new THREE.Vector3();
+            labelsData.forEach(data => {
+                wp.copy(data.pos);
+                wp.project(camera);
+                
+                const x = (wp.x * 0.5 + 0.5) * window.innerWidth;
+                const y = (-(wp.y * 0.5) + 0.5) * window.innerHeight;
+                
+                if(wp.z > 1) {
+                    data.element.style.display = 'none';
+                } else {
+                    data.element.style.display = 'block';
+                    data.element.style.left = `${x}px`;
+                    data.element.style.top = `${y}px`;
+                }
+            });
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    </script>
+</body>
+</html>
